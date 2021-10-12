@@ -1,0 +1,5 @@
+papers/
+zim_notebook/
+*.npz
+single_lut_performance.jpg
+.ipynb_checkpoints/
