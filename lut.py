@@ -3,6 +3,8 @@ import copy
 import multiprocessing
 import os
 import pdb
+from sklearn.metrics import accuracy_score
+from tqdm import tqdm
 
 def get_idxs(X, bit_pattern_tiled, N, bits):
     """
@@ -175,7 +177,7 @@ class Lut:
         pool = multiprocessing.Pool()
 
         if len(self.hidden_layers) > 0:
-            for j, num_luts in enumerate(self.hidden_layers):
+            for j, num_luts in enumerate(tqdm(self.hidden_layers)):
                 self.cols_arr_.append(
                     np.array(
                         pool.starmap(
@@ -287,3 +289,54 @@ class Lut:
         idxs = get_idxs(X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits)
         preds = self.lut_arr_[-1][idxs]
         return preds
+
+
+    def get_accuracies_per_layer(self, X, y):
+        """
+        Get accuracies per layer.
+
+        Parameters
+        ==========
+        X: np.ndarray
+            The input data of shape `(N, bits)` and dtype bool.
+
+        Returns
+        =======
+        acc: list
+        """
+        assert X.dtype == bool, f"Dtype of X has to be bool, got {X.dtype}"
+        N = X.shape[0]
+        bit_pattern_tiled = np.tile(self.bit_pattern, (N, 1))
+
+        if len(self.hidden_layers) == 0:
+            X_ = X
+
+        pool = multiprocessing.Pool()
+        acc = []
+        for j, num_luts in enumerate(tqdm(self.hidden_layers)):
+            idxs = np.array(
+                pool.starmap(
+                    get_idxs,
+                    [
+                        [
+                            X[:, self.cols_arr_[0][i]]
+                            if j == 0
+                            else X_[:, self.cols_arr_[j][i]],
+                            bit_pattern_tiled,
+                            N,
+                            self.bits,
+                        ]
+                        for i in range(num_luts)
+                    ],
+                )
+            )
+            X_ = np.array([self.lut_arr_[j][i][idxs[i]] for i in range(num_luts)]).T
+            acc_layer = []
+            for i in range(X_.shape[1]):
+                acc_layer.append(accuracy_score(X_[:, i], y))
+            acc.append(acc_layer)
+
+        idxs = get_idxs(X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits)
+        preds = self.lut_arr_[-1][idxs]
+        acc.append([accuracy_score(preds, y)])
+        return acc

@@ -27,3 +27,6 @@ seminar/Images
 *.toc
 *.log
 *.blg
+*.isy
+tmp_aig.aag
+seminar/main.pdf

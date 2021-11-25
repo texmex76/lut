@@ -1,0 +1,59 @@
+
+digraph G {
+
+        rankdir=LR
+    splines=line
+        nodesep=.05;
+        
+        node [label=""];
+        
+        subgraph cluster_0 {
+        color=white;
+        node [style=solid,color=blue4, shape=circle];
+        x0 [pos="0,2.4!"];
+        x1 [pos="0,1.8!"];
+        x2 [pos="0,1.2!"];
+        x3 [pos="0,0.6!"];
+        x4 [pos="0,0!"];
+        label = "Input";
+    }
+
+    subgraph cluster_1 {
+        color=white;
+        node [style=solid,color=red2, shape=circle];
+        a11 [pos="1,2.1!"];
+        a12 [pos="1,1.2!"];
+        a13 [pos="1,0.3!"];
+        label = "Hidden 1";
+    }
+
+    subgraph cluster_2 {
+        color=white;
+        node [style=solid,color=red2, shape=circle];
+        a21 [pos="2,2.1!"];
+        a22 [pos="2,1.2!"];
+        a23 [pos="2,0.3!"];
+        label = "Hidden 2";
+    }
+
+    subgraph cluster_3 {
+        color=white;
+        node [style=solid,color=seagreen2, shape=circle];
+        O1 [pos="3,1.2!"];
+        label="Output";
+    }
+a21 -> O1;
+a22 -> O1;
+a11 -> a21;
+a12 -> a21;
+a13 -> a22;
+a12 -> a22;
+a13 -> a23;
+a12 -> a23;
+x3 -> a11;
+x1 -> a11;
+x4 -> a12;
+x0 -> a12;
+x0 -> a13;
+x1 -> a13;
+}
