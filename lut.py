@@ -111,9 +111,9 @@ class Lut:
 
     Parameters
     ==========
-    bits: int
-        Number of bits of each individual lut. When creating a single lut,
-        if the number of bits is the same as the number of features, then
+    bits: list of ints
+        Number of bits of each individual lut in each layer. When creating a single
+        lut, if the number of bits is the same as the number of features, then
         all columns of the features will be used, otherwise a random assortment
         of columns.
     hidden_layers: list of ints
@@ -139,16 +139,24 @@ class Lut:
         If the corresponding entry in `rnd_arr_` is `True`, then the lut entry was
         randomly selected during tie-breaking.
     """
-    def __init__(self, bits, hidden_layers=[]):
+    def __init__(self, bits, hidden_layers=[], discard_bad_luts=False, des_acc=None, discard_num=10, patience=10, make_aig=False, discard_randoms=False, verbose=False):
         self.bits = bits
         self.hidden_layers = hidden_layers
-        self.bit_pattern = get_bit_pattern(bits)
+        assert len(bits) == len(hidden_layers) + 1
 
         self.cols_arr_ = []
         self.lut_arr_ = []
         self.rnd_arr_ = []
 
-    def train(self, X, y):
+        self.discard_bad_luts = discard_bad_luts
+        self.des_acc = des_acc
+        self.discard_num = discard_num
+        self.patience = patience
+        self.make_aig = make_aig
+        self.discard_randoms = discard_randoms
+        self.verbose = verbose
+
+    def train(self, X, y, majority_vote=False):
         """
         Train the network of luts or a single lut. The prediction for the training set
         is returned because during training, propagation is already happening and this
@@ -169,7 +177,6 @@ class Lut:
         assert X.dtype == bool, f"Dtype of X has to be bool, got {X.dtype}"
         assert y.dtype == bool, f"Dtype of y has to be bool, got {y.dtype}"
         N = X.shape[0]
-        bit_pattern_tiled = np.tile(self.bit_pattern, (N, 1))
         y_ = y.copy().astype(int)
         y_[y_ == 0] = -1
         y_[y_ == 1] = 1
@@ -177,76 +184,291 @@ class Lut:
         pool = multiprocessing.Pool()
 
         if len(self.hidden_layers) > 0:
-            for j, num_luts in enumerate(tqdm(self.hidden_layers)):
-                self.cols_arr_.append(
-                    np.array(
+            with tqdm(self.hidden_layers, disable=not self.verbose) as t:
+                for j, num_luts in enumerate(t):
+                # for j, num_luts in enumerate(tqdm(self.hidden_layers)):
+                    bit_pattern = get_bit_pattern(self.bits[j])
+                    bit_pattern_tiled = np.tile(bit_pattern, (N, 1))
+                    cols = np.random.choice(X.shape[1] if j == 0 else self.hidden_layers[j - 1], size=num_luts*self.bits[j]).reshape((num_luts, self.bits[j]))
+                    self.cols_arr_.append(cols)
+                    idxs = np.array(
                         pool.starmap(
-                            get_cols,
+                            get_idxs,
                             [
                                 [
-                                    X.shape[1] if j == 0 else self.hidden_layers[j - 1],
-                                    self.bits,
+                                    X[:, self.cols_arr_[-1][i]]
+                                    if j == 0
+                                    else X_[:, self.cols_arr_[-1][i]],
+                                    bit_pattern_tiled,
+                                    N,
+                                    self.bits[j],
                                 ]
-                            ]
-                            * num_luts,
+                                for i in range(num_luts)
+                            ],
                         )
                     )
-                )
-                idxs = np.array(
-                    pool.starmap(
-                        get_idxs,
-                        [
-                            [
-                                X[:, self.cols_arr_[-1][i]]
-                                if j == 0
-                                else X_[:, self.cols_arr_[-1][i]],
-                                bit_pattern_tiled,
-                                N,
-                                self.bits,
-                            ]
-                            for i in range(num_luts)
-                        ],
-                    )
-                )
-                tmp = np.array(
-                        pool.starmap(
-                            get_lut,
-                            [[idxs[i], y_, self.bits] for i in range(num_luts)],
+                    tmp = np.array(
+                            pool.starmap(
+                                get_lut,
+                                [[idxs[i], y_, self.bits[j]] for i in range(num_luts)],
+                            )
                         )
-                    )
-                self.lut_arr_.append(tmp[:, :2**self.bits].copy())
-                self.rnd_arr_.append(tmp[:, 2**self.bits:].copy())
-                X_ = np.array([self.lut_arr_[-1][i][idxs[i]] for i in range(num_luts)]).T
+                    self.lut_arr_.append(tmp[:, :2**self.bits[j]].copy())
+                    self.rnd_arr_.append(tmp[:, 2**self.bits[j]:].copy())
+                    X_ = np.array([self.lut_arr_[-1][i][idxs[i]] for i in range(num_luts)]).T
 
-            self.cols_arr_.append(
-                np.random.choice(range(self.hidden_layers[-1]), size=self.bits)
-            )
+                    #####################################################################
+                    ##### Discarding bad Luts ###########################################
+                    #####################################################################
+                    if self.discard_bad_luts:
+                        acc_layer = []
+                        for i in range(X_.shape[1]):
+                            acc_layer.append(accuracy_score(X_[:, i], y))
+                        best = 0
+                        no_change = 0
+                        while(np.mean(acc_layer) < self.des_acc[j] and not no_change > self.patience):
+                            t.set_description(f"Layer {j} Acc {np.mean(acc_layer):.4f}")
+                            # Delete discard_num worst luts
+                            del_idxs = [x[1] for x in sorted(list(zip(acc_layer, range(len(acc_layer)))), key=lambda x: x[0])[:self.discard_num]]
+                            self.lut_arr_[-1] = np.delete(self.lut_arr_[-1], del_idxs, axis=0)
+                            self.cols_arr_[-1] = np.delete(self.cols_arr_[-1], del_idxs, axis=0)
+                            self.rnd_arr_[-1] = np.delete(self.rnd_arr_[-1], del_idxs, axis=0)
+                            cols = np.random.choice(X.shape[1] if j == 0 else self.hidden_layers[j - 1], size=self.discard_num*self.bits[j]).reshape((self.discard_num, self.bits[j]))
+                            idxs = np.array(
+                                pool.starmap(
+                                    get_idxs,
+                                    [
+                                        [
+                                            X[:, cols[i]]
+                                            if j == 0
+                                            else X_[:, cols[i]],
+                                            bit_pattern_tiled,
+                                            N,
+                                            self.bits[j],
+                                        ]
+                                        for i in range(self.discard_num)
+                                    ],
+                                )
+                            )
+                            tmp = np.array(
+                                    pool.starmap(
+                                        get_lut,
+                                        [[idxs[i], y_, self.bits[j]] for i in range(self.discard_num)],
+                                    )
+                                )
+                            self.lut_arr_[-1] = np.vstack((self.lut_arr_[-1], tmp[:, :2**self.bits[j]].copy()))
+                            self.cols_arr_[-1] = np.vstack((self.cols_arr_[-1], cols))
+                            self.rnd_arr_[-1] = np.vstack((self.rnd_arr_[-1], tmp[:, 2**self.bits[j]:].copy()))
+                            idxs = np.array(
+                                pool.starmap(
+                                    get_idxs,
+                                    [
+                                        [
+                                            X[:, self.cols_arr_[-1][i]]
+                                            if j == 0
+                                            else X_[:, self.cols_arr_[-1][i]],
+                                            bit_pattern_tiled,
+                                            N,
+                                            self.bits[j],
+                                        ]
+                                        for i in range(num_luts)
+                                    ],
+                                )
+                            )
+                            X_ = np.array([self.lut_arr_[-1][i][idxs[i]] for i in range(num_luts)]).T
+                            acc_layer = []
+                            for i in range(X_.shape[1]):
+                                acc_layer.append(accuracy_score(X_[:, i], y))
+
+                            # To avoid getting stuck
+                            current = np.mean(acc_layer)
+                            if current > best:
+                                best = current
+                                no_change = 0
+                            else:
+                                no_change += 1
+                    #####################################################################
+                    ##### End Discarding bad Luts #######################################
+                    #####################################################################
+
+                    #####################################################################
+                    ##### Discarding Randoms ############################################
+                    #####################################################################
+                    if self.discard_randoms:
+                        no_change = 0
+                        randoms_old = np.any(self.rnd_arr_[-1], axis=1).sum()
+                        randoms = np.any(self.rnd_arr_[-1], axis=1).sum()
+                        while(self.rnd_arr_[-1].sum() != 0 and not no_change > self.patience):
+                            t.set_description(f"Layer {j} Randoms: {randoms} No change: {no_change}")
+                            # Delete luts that have random entries
+                            del_idxs = np.any(self.rnd_arr_[-1], axis=1)
+                            self.lut_arr_[-1] = np.delete(self.lut_arr_[-1], del_idxs, axis=0)
+                            self.cols_arr_[-1] = np.delete(self.cols_arr_[-1], del_idxs, axis=0)
+                            self.rnd_arr_[-1] = np.delete(self.rnd_arr_[-1], del_idxs, axis=0)
+                            cols = np.random.choice(X.shape[1] if j == 0 else self.hidden_layers[j - 1], size=randoms*self.bits[j]).reshape((randoms, self.bits[j]))
+                            idxs = np.array(
+                                pool.starmap(
+                                    get_idxs,
+                                    [
+                                        [
+                                            X[:, cols[i]]
+                                            if j == 0
+                                            else X_[:, cols[i]],
+                                            bit_pattern_tiled,
+                                            N,
+                                            self.bits[j],
+                                        ]
+                                        for i in range(randoms)
+                                    ],
+                                )
+                            )
+                            tmp = np.array(
+                                    pool.starmap(
+                                        get_lut,
+                                        [[idxs[i], y_, self.bits[j]] for i in range(randoms)],
+                                    )
+                                )
+                            self.lut_arr_[-1] = np.vstack((self.lut_arr_[-1], tmp[:, :2**self.bits[j]].copy()))
+                            self.cols_arr_[-1] = np.vstack((self.cols_arr_[-1], cols))
+                            self.rnd_arr_[-1] = np.vstack((self.rnd_arr_[-1], tmp[:, 2**self.bits[j]:].copy()))
+                            idxs = np.array(
+                                pool.starmap(
+                                    get_idxs,
+                                    [
+                                        [
+                                            X[:, self.cols_arr_[-1][i]]
+                                            if j == 0
+                                            else X_[:, self.cols_arr_[-1][i]],
+                                            bit_pattern_tiled,
+                                            N,
+                                            self.bits[j],
+                                        ]
+                                        for i in range(num_luts)
+                                    ],
+                                )
+                            )
+                            X_ = np.array([self.lut_arr_[-1][i][idxs[i]] for i in range(num_luts)]).T
+
+                            randoms = np.any(self.rnd_arr_[-1], axis=1).sum()
+                            if randoms >= randoms_old:
+                                no_change += 1
+                            randoms_old = randoms
+                    #####################################################################
+                    ##### End Discarding Randoms ########################################
+                    #####################################################################
+
+                    #####################################################################
+                    ##### Make AIG ######################################################
+                    #####################################################################
+                    if self.make_aig:
+                        iteration = 0
+                        while(np.sum(self.lut_arr_[-1].sum(1) == 1) < num_luts):
+                            # Delete luts that are not AIGs
+                            del_idxs = np.where(self.lut_arr_[-1].sum(1) != 1)[0]
+                            num_discarded = len(del_idxs)
+                            frac_non_aig = num_discarded / num_luts
+                            t.set_description(f"Layer {j} Iter {iteration} Frac non AIG {frac_non_aig:.3f}")
+                            self.lut_arr_[-1] = np.delete(self.lut_arr_[-1], del_idxs, axis=0)
+                            self.cols_arr_[-1] = np.delete(self.cols_arr_[-1], del_idxs, axis=0)
+                            self.rnd_arr_[-1] = np.delete(self.rnd_arr_[-1], del_idxs, axis=0)
+                            cols = np.random.choice(X.shape[1] if j == 0 else self.hidden_layers[j - 1], size=num_discarded*self.bits[j]).reshape((num_discarded, self.bits[j]))
+                            idxs = np.array(
+                                pool.starmap(
+                                    get_idxs,
+                                    [
+                                        [
+                                            X[:, cols[i]]
+                                            if j == 0
+                                            else X_[:, cols[i]],
+                                            bit_pattern_tiled,
+                                            N,
+                                            self.bits[j],
+                                        ]
+                                        for i in range(num_discarded)
+                                    ],
+                                )
+                            )
+                            tmp = np.array(
+                                    pool.starmap(
+                                        get_lut,
+                                        [[idxs[i], y_, self.bits[j]] for i in range(num_discarded)],
+                                    )
+                                )
+                            self.lut_arr_[-1] = np.vstack((self.lut_arr_[-1], tmp[:, :2**self.bits[j]].copy()))
+                            self.cols_arr_[-1] = np.vstack((self.cols_arr_[-1], cols))
+                            self.rnd_arr_[-1] = np.vstack((self.rnd_arr_[-1], tmp[:, 2**self.bits[j]:].copy()))
+                            idxs = np.array(
+                                pool.starmap(
+                                    get_idxs,
+                                    [
+                                        [
+                                            X[:, self.cols_arr_[-1][i]]
+                                            if j == 0
+                                            else X_[:, self.cols_arr_[-1][i]],
+                                            bit_pattern_tiled,
+                                            N,
+                                            self.bits[j],
+                                        ]
+                                        for i in range(num_luts)
+                                    ],
+                                )
+                            )
+                            X_ = np.array([self.lut_arr_[-1][i][idxs[i]] for i in range(num_luts)]).T
+                            iteration += 1
+                    #####################################################################
+                    ##### End Make AIG ##################################################
+                    #####################################################################
+
+            cols = np.random.choice(self.hidden_layers[-1], size=self.bits[-1])
+            self.cols_arr_.append(cols)
+            bit_pattern = get_bit_pattern(self.bits[-1])
+            bit_pattern_tiled = np.tile(bit_pattern, (N, 1))
             idxs = get_idxs(
-                X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits
+                X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits[-1]
             )
-            tmp = get_lut(idxs, y_, self.bits)
-            self.lut_arr_.append(tmp[:2**self.bits].copy())
-            self.rnd_arr_.append(tmp[2**self.bits:].copy())
+            tmp = get_lut(idxs, y_, self.bits[-1])
+            self.lut_arr_.append(tmp[:2**self.bits[-1]].copy())
+            self.rnd_arr_.append(tmp[2**self.bits[-1]:].copy())
             preds_train = self.lut_arr_[-1][idxs]
+
+            #####################################################################
+            ##### Majority Vote #################################################
+            #####################################################################
+            if majority_vote:
+                Xa = X_.copy().astype(int)
+                Xa[Xa == 0] = -1
+                Xa[Xa == 1] = 1
+                Xa = Xa.sum(1)
+                Xa[Xa > 0] = 1
+                Xa[Xa < 0] = 0
+                Xa[Xa == 0] = 0 # for now, this'll do
+                Xa = Xa.astype(bool)
+                preds_train = Xa
+            #####################################################################
+            ##### End Majority Vote #############################################
+            #####################################################################
+
             return preds_train
         else:
-            if X.shape[1] == self.bits:
+            if X.shape[1] == self.bits[0]:
                 self.cols_arr_.append(np.arange(X.shape[1]))
             else:
                 self.cols_arr_.append(
-                    np.random.choice(X.shape[1], size=self.bits)
+                    np.random.choice(X.shape[1], size=self.bits[0])
                 )
+            bit_pattern = get_bit_pattern(self.bits[0])
+            bit_pattern_tiled = np.tile(bit_pattern, (N, 1))
             idxs = get_idxs(
-                X[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits
+                X[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits[0]
             )
-            tmp = get_lut(idxs, y_, self.bits)
-            self.lut_arr_.append(tmp[:2**self.bits].copy())
-            self.rnd_arr_.append(tmp[2**self.bits:].copy())
+            tmp = get_lut(idxs, y_, self.bits[0])
+            self.lut_arr_.append(tmp[:2**self.bits[0]].copy())
+            self.rnd_arr_.append(tmp[2**self.bits[0]:].copy())
             preds_train = self.lut_arr_[-1][idxs]
             return preds_train
 
 
-    def predict(self, X):
+    def predict(self, X, majority_vote=False):
         """
         Predict using the lut classifier.
 
@@ -261,13 +483,14 @@ class Lut:
         """
         assert X.dtype == bool, f"Dtype of X has to be bool, got {X.dtype}"
         N = X.shape[0]
-        bit_pattern_tiled = np.tile(self.bit_pattern, (N, 1))
 
         if len(self.hidden_layers) == 0:
             X_ = X
 
         pool = multiprocessing.Pool()
         for j, num_luts in enumerate(self.hidden_layers):
+            bit_pattern = get_bit_pattern(self.bits[j])
+            bit_pattern_tiled = np.tile(bit_pattern, (N, 1))
             idxs = np.array(
                 pool.starmap(
                     get_idxs,
@@ -278,7 +501,7 @@ class Lut:
                             else X_[:, self.cols_arr_[j][i]],
                             bit_pattern_tiled,
                             N,
-                            self.bits,
+                            self.bits[j],
                         ]
                         for i in range(num_luts)
                     ],
@@ -286,8 +509,28 @@ class Lut:
             )
             X_ = np.array([self.lut_arr_[j][i][idxs[i]] for i in range(num_luts)]).T
 
-        idxs = get_idxs(X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits)
+        bit_pattern = get_bit_pattern(self.bits[-1])
+        bit_pattern_tiled = np.tile(bit_pattern, (N, 1))
+        idxs = get_idxs(X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits[-1])
         preds = self.lut_arr_[-1][idxs]
+
+        #####################################################################
+        ##### Majority Vote #################################################
+        #####################################################################
+        if majority_vote:
+            Xa = X_.copy().astype(int)
+            Xa[Xa == 0] = -1
+            Xa[Xa == 1] = 1
+            Xa = Xa.sum(1)
+            Xa[Xa > 0] = 1
+            Xa[Xa < 0] = 0
+            Xa[Xa == 0] = 0 # for now, this'll do
+            Xa = Xa.astype(bool)
+            preds = Xa
+        #####################################################################
+        ##### End Majority Vote #############################################
+        #####################################################################
+
         return preds
 
 
@@ -306,7 +549,6 @@ class Lut:
         """
         assert X.dtype == bool, f"Dtype of X has to be bool, got {X.dtype}"
         N = X.shape[0]
-        bit_pattern_tiled = np.tile(self.bit_pattern, (N, 1))
 
         if len(self.hidden_layers) == 0:
             X_ = X
@@ -314,6 +556,8 @@ class Lut:
         pool = multiprocessing.Pool()
         acc = []
         for j, num_luts in enumerate(tqdm(self.hidden_layers)):
+            bit_pattern = get_bit_pattern(self.bits[j])
+            bit_pattern_tiled = np.tile(bit_pattern, (N, 1))
             idxs = np.array(
                 pool.starmap(
                     get_idxs,
@@ -324,7 +568,7 @@ class Lut:
                             else X_[:, self.cols_arr_[j][i]],
                             bit_pattern_tiled,
                             N,
-                            self.bits,
+                            self.bits[j],
                         ]
                         for i in range(num_luts)
                     ],
@@ -336,7 +580,9 @@ class Lut:
                 acc_layer.append(accuracy_score(X_[:, i], y))
             acc.append(acc_layer)
 
-        idxs = get_idxs(X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits)
+        bit_pattern = get_bit_pattern(self.bits[-1])
+        bit_pattern_tiled = np.tile(bit_pattern, (N, 1))
+        idxs = get_idxs(X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits[-1])
         preds = self.lut_arr_[-1][idxs]
         acc.append([accuracy_score(preds, y)])
         return acc
