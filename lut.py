@@ -23,6 +23,7 @@ def get_idxs(X, bit_pattern_tiled, N, bits):
     bits:
         Number of bits, i.e. `X.shape[1]`.
     """
+    assert X.shape == (N, bits), "Shape of X has to be `(N, bits)`"
     return np.where(
         np.all(bit_pattern_tiled == np.repeat(X, 2 ** bits, axis=0), axis=1,).reshape(
             (N, 2 ** bits)
@@ -119,6 +120,20 @@ class Lut:
     hidden_layers: list of ints
         Hidden layer sizes. The depth of the lut network is determined by how many
         ints are in this list. If empty, a single lut will be created.
+    improve_layer_acc: bool
+        Try to improve layer-wise accuracy.
+    discard_num: int
+        Only relevant if `improve_layer_acc` is set to `True`. Each time luts are
+        to be thrown away, specifies the amount.
+    discard_randoms: bool
+        If set to `True`, removes luts where there are random entries.
+    patience: int
+        Only relevant if `improve_layer_acc` or `discard_randoms` is set to `True`.
+    make_aig: bool
+        If set to `True`, only keeps luts that are directly translatable into an
+        AIG, i.e. whose truth table could also be the one of an AIG.
+    verbose: bool
+        If set to `True`, displays a progress bar.
 
     Attributes
     ==========
@@ -139,7 +154,7 @@ class Lut:
         If the corresponding entry in `rnd_arr_` is `True`, then the lut entry was
         randomly selected during tie-breaking.
     """
-    def __init__(self, bits, hidden_layers=[], discard_bad_luts=False, des_acc=None, discard_num=10, patience=10, make_aig=False, discard_randoms=False, verbose=False):
+    def __init__(self, bits, hidden_layers=[], improve_layer_acc=False, discard_num=10, discard_randoms=False, patience=10, make_aig=False, verbose=False):
         self.bits = bits
         self.hidden_layers = hidden_layers
         assert len(bits) == len(hidden_layers) + 1
@@ -148,15 +163,14 @@ class Lut:
         self.lut_arr_ = []
         self.rnd_arr_ = []
 
-        self.discard_bad_luts = discard_bad_luts
-        self.des_acc = des_acc
+        self.improve_layer_acc = improve_layer_acc
         self.discard_num = discard_num
         self.patience = patience
         self.make_aig = make_aig
         self.discard_randoms = discard_randoms
         self.verbose = verbose
 
-    def train(self, X, y, majority_vote=False):
+    def train(self, X, y):
         """
         Train the network of luts or a single lut. The prediction for the training set
         is returned because during training, propagation is already happening and this
@@ -186,7 +200,6 @@ class Lut:
         if len(self.hidden_layers) > 0:
             with tqdm(self.hidden_layers, disable=not self.verbose) as t:
                 for j, num_luts in enumerate(t):
-                # for j, num_luts in enumerate(tqdm(self.hidden_layers)):
                     bit_pattern = get_bit_pattern(self.bits[j])
                     bit_pattern_tiled = np.tile(bit_pattern, (N, 1))
                     cols = np.random.choice(X.shape[1] if j == 0 else self.hidden_layers[j - 1], size=num_luts*self.bits[j]).reshape((num_luts, self.bits[j]))
@@ -196,9 +209,9 @@ class Lut:
                             get_idxs,
                             [
                                 [
-                                    X[:, self.cols_arr_[-1][i]]
+                                    X[:, self.cols_arr_[j][i]]
                                     if j == 0
-                                    else X_[:, self.cols_arr_[-1][i]],
+                                    else X_[:, self.cols_arr_[j][i]],
                                     bit_pattern_tiled,
                                     N,
                                     self.bits[j],
@@ -215,24 +228,23 @@ class Lut:
                         )
                     self.lut_arr_.append(tmp[:, :2**self.bits[j]].copy())
                     self.rnd_arr_.append(tmp[:, 2**self.bits[j]:].copy())
-                    X_ = np.array([self.lut_arr_[-1][i][idxs[i]] for i in range(num_luts)]).T
+                    if "X_" in locals():
+                        X_prev_ = X_.copy() # previous prediction
+                    X_ = np.array([self.lut_arr_[j][i][idxs[i]] for i in range(num_luts)]).T # current prediction
 
                     #####################################################################
-                    ##### Discarding bad Luts ###########################################
+                    ##### Improve layer accuracy ########################################
                     #####################################################################
-                    if self.discard_bad_luts:
+                    if self.improve_layer_acc:
                         acc_layer = []
                         for i in range(X_.shape[1]):
                             acc_layer.append(accuracy_score(X_[:, i], y))
                         best = 0
                         no_change = 0
-                        while(np.mean(acc_layer) < self.des_acc[j] and not no_change > self.patience):
+                        while(not no_change > self.patience):
                             t.set_description(f"Layer {j} Acc {np.mean(acc_layer):.4f}")
                             # Delete discard_num worst luts
-                            del_idxs = [x[1] for x in sorted(list(zip(acc_layer, range(len(acc_layer)))), key=lambda x: x[0])[:self.discard_num]]
-                            self.lut_arr_[-1] = np.delete(self.lut_arr_[-1], del_idxs, axis=0)
-                            self.cols_arr_[-1] = np.delete(self.cols_arr_[-1], del_idxs, axis=0)
-                            self.rnd_arr_[-1] = np.delete(self.rnd_arr_[-1], del_idxs, axis=0)
+                            del_idxs = np.argsort(acc_layer)[:self.discard_num]
                             cols = np.random.choice(X.shape[1] if j == 0 else self.hidden_layers[j - 1], size=self.discard_num*self.bits[j]).reshape((self.discard_num, self.bits[j]))
                             idxs = np.array(
                                 pool.starmap(
@@ -241,7 +253,7 @@ class Lut:
                                         [
                                             X[:, cols[i]]
                                             if j == 0
-                                            else X_[:, cols[i]],
+                                            else X_prev_[:, cols[i]], # previous prediction
                                             bit_pattern_tiled,
                                             N,
                                             self.bits[j],
@@ -256,17 +268,18 @@ class Lut:
                                         [[idxs[i], y_, self.bits[j]] for i in range(self.discard_num)],
                                     )
                                 )
-                            self.lut_arr_[-1] = np.vstack((self.lut_arr_[-1], tmp[:, :2**self.bits[j]].copy()))
-                            self.cols_arr_[-1] = np.vstack((self.cols_arr_[-1], cols))
-                            self.rnd_arr_[-1] = np.vstack((self.rnd_arr_[-1], tmp[:, 2**self.bits[j]:].copy()))
+                            for k, del_idx in enumerate(del_idxs):
+                                self.lut_arr_[j][del_idx] = tmp[:, :2**self.bits[j]].copy()[k]
+                                self.cols_arr_[j][del_idx] = cols[k]
+                                self.rnd_arr_[j][del_idx] = tmp[:, 2**self.bits[j]:].copy()[k]
                             idxs = np.array(
                                 pool.starmap(
                                     get_idxs,
                                     [
                                         [
-                                            X[:, self.cols_arr_[-1][i]]
+                                            X[:, self.cols_arr_[j][i]]
                                             if j == 0
-                                            else X_[:, self.cols_arr_[-1][i]],
+                                            else X_prev_[:, self.cols_arr_[j][i]], # previous prediction
                                             bit_pattern_tiled,
                                             N,
                                             self.bits[j],
@@ -275,7 +288,7 @@ class Lut:
                                     ],
                                 )
                             )
-                            X_ = np.array([self.lut_arr_[-1][i][idxs[i]] for i in range(num_luts)]).T
+                            X_ = np.array([self.lut_arr_[j][i][idxs[i]] for i in range(num_luts)]).T # current prediction
                             acc_layer = []
                             for i in range(X_.shape[1]):
                                 acc_layer.append(accuracy_score(X_[:, i], y))
@@ -288,7 +301,7 @@ class Lut:
                             else:
                                 no_change += 1
                     #####################################################################
-                    ##### End Discarding bad Luts #######################################
+                    ##### End Improve layer accuracy ####################################
                     #####################################################################
 
                     #####################################################################
@@ -431,23 +444,6 @@ class Lut:
             self.rnd_arr_.append(tmp[2**self.bits[-1]:].copy())
             preds_train = self.lut_arr_[-1][idxs]
 
-            #####################################################################
-            ##### Majority Vote #################################################
-            #####################################################################
-            if majority_vote:
-                Xa = X_.copy().astype(int)
-                Xa[Xa == 0] = -1
-                Xa[Xa == 1] = 1
-                Xa = Xa.sum(1)
-                Xa[Xa > 0] = 1
-                Xa[Xa < 0] = 0
-                Xa[Xa == 0] = 0 # for now, this'll do
-                Xa = Xa.astype(bool)
-                preds_train = Xa
-            #####################################################################
-            ##### End Majority Vote #############################################
-            #####################################################################
-
             return preds_train
         else:
             if X.shape[1] == self.bits[0]:
@@ -522,9 +518,10 @@ class Lut:
             Xa[Xa == 0] = -1
             Xa[Xa == 1] = 1
             Xa = Xa.sum(1)
+            mask = np.where(Xa == 0)[0]
             Xa[Xa > 0] = 1
             Xa[Xa < 0] = 0
-            Xa[Xa == 0] = 0 # for now, this'll do
+            Xa[mask] = np.random.choice([0, 1], size=mask.shape[0])
             Xa = Xa.astype(bool)
             preds = Xa
         #####################################################################
@@ -542,6 +539,8 @@ class Lut:
         ==========
         X: np.ndarray
             The input data of shape `(N, bits)` and dtype bool.
+        y: np.ndarray
+            The labels of shape `(N, 1)` and dtype bool.
 
         Returns
         =======
@@ -585,4 +584,18 @@ class Lut:
         idxs = get_idxs(X_[:, self.cols_arr_[-1]], bit_pattern_tiled, N, self.bits[-1])
         preds = self.lut_arr_[-1][idxs]
         acc.append([accuracy_score(preds, y)])
-        return acc
+        return preds, acc
+
+def get_lut_size(bits: int, layers: list):
+    single_lut_size = 2 ** bits # Size in bits
+    total_lut_size = 0
+    for num_luts in layers:
+        total_lut_size += num_luts * single_lut_size
+    return total_lut_size / 8 # Size in bytes
+
+def viz_size(size):
+    # Size is in bytes
+    print(f"{size/1e6:.3f} MB")
+    print(f"{size/1e3:.0f} KB")
+    print(f"{size:.0f} B")
+
