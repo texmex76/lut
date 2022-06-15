@@ -1,0 +1,13 @@
+name: lut
+channels:
+  - pytorch
+  - anaconda
+  - conda-forge
+  - defaults
+dependencies:
+  - graphviz
+  - matplotlib
+  - numpy
+  - scikit-learn
+  - scipy
+  - tqdm
